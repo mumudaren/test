@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         飞书文档提取并打印
 // @namespace    feishu-extract-text
-// @version      1.1.1
+// @version      1.2.0
 // @description  把已打开的飞书新版文档导出成带图片、可打印的网页，尽量保持标题、分栏和表格位置
 // @match        https://*.feishu.cn/wiki/*
 // @match        https://*.feishu.cn/docx/*
@@ -10,20 +10,14 @@
 // @match        https://*.larkoffice.com/wiki/*
 // @match        https://*.larkoffice.com/docx/*
 // @run-at       document-idle
-// @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
-// @connect      feishu.cn
-// @connect      larksuite.com
-// @connect      larkoffice.com
-// @connect      feishucdn.com
-// @connect      internal-api-drive-stream.feishu.cn
+// @grant        none
 // ==/UserScript==
 
 (function () {
   "use strict";
 
   const DOCX_TYPE = 22;
-  const pageFetch = (unsafeWindow || window).fetch.bind(unsafeWindow || window);
+  const pageFetch = window.fetch.bind(window);
 
   function tokenFromUrl() {
     const match = location.pathname.match(/\/(wiki|docx)\/([A-Za-z0-9]+)/);
@@ -87,26 +81,6 @@
       .replace(/"/g, "&quot;");
   }
 
-  function gmGetBlob(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: "GET",
-        url,
-        responseType: "blob",
-        onload: (res) => {
-          const blob = res.response;
-          const type = blob && blob.type ? blob.type : "";
-          if (res.status >= 200 && res.status < 300 && blob && blob.size > 200 && !type.includes("json") && !type.includes("text")) {
-            resolve(blob);
-            return;
-          }
-          reject(new Error("图片下载失败 " + res.status));
-        },
-        onerror: () => reject(new Error("图片网络错误")),
-      });
-    });
-  }
-
   function blobToDataUrl(blob) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -116,34 +90,66 @@
     });
   }
 
-  function imageUrls(token, blockId) {
-    // 只用文档阅读时的预览图。download/all 会被飞书当成导出，无导出权限时会直接拒绝。
-    const mount = "mount_point=docx_image&mount_node_token=" + encodeURIComponent(blockId);
-    const heights = [1920, 1280];
-    const covers = heights.map(
-      (height) =>
-        "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/v2/cover/" +
-        token +
-        "/?fallback_source=1&height=" +
-        height +
-        "&policy=equal&" +
-        mount
-    );
-    return covers.concat([
-      "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/preview/" + token + "?preview_type=16",
-    ]);
+  function findScroller() {
+    const nodes = Array.from(document.querySelectorAll("div"));
+    let best = null;
+    nodes.forEach((el) => {
+      const style = getComputedStyle(el);
+      if ((style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 300) {
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+    });
+    return best || document.scrollingElement || document.documentElement;
   }
 
-  async function downloadImage(token, blockId) {
-    let lastError = null;
-    for (const url of imageUrls(token, blockId)) {
+  function snapVisibleImages(store) {
+    document.querySelectorAll(".docx-image-block").forEach((block) => {
+      const id = block.getAttribute("data-record-id");
+      if (!id || store[id]) return;
+      const img = block.querySelector("img");
+      if (!img || !img.naturalWidth) return;
       try {
-        return await blobToDataUrl(await gmGetBlob(url));
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        canvas.getContext("2d").drawImage(img, 0, 0);
+        store[id] = canvas.toDataURL("image/jpeg", 0.92);
       } catch (error) {
-        lastError = error;
+        const src = img.currentSrc || img.src;
+        if (src && src.startsWith("blob:")) store[id] = src;
+      }
+    });
+  }
+
+  async function captureRenderedImages(onProgress) {
+    const store = {};
+    const scroller = findScroller();
+    const previous = scroller.scrollTop;
+    scroller.scrollTop = 0;
+    let stable = 0;
+    let lastHeight = 0;
+    for (let step = 0; step < 100 && stable < 2; step += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 280));
+      snapVisibleImages(store);
+      onProgress(Object.keys(store).length);
+      const height = scroller.scrollHeight;
+      const atEnd = scroller.scrollTop + scroller.clientHeight >= height - 8;
+      stable = atEnd && height === lastHeight ? stable + 1 : 0;
+      lastHeight = height;
+      scroller.scrollTop += Math.max(360, Math.floor(scroller.clientHeight * 0.75));
+    }
+    snapVisibleImages(store);
+    const blobs = Object.entries(store).filter((entry) => entry[1].startsWith("blob:"));
+    for (const [id, src] of blobs) {
+      try {
+        const response = await pageFetch(src);
+        store[id] = await blobToDataUrl(await response.blob());
+      } catch (error) {
+        delete store[id];
       }
     }
-    throw lastError || new Error("图片下载失败");
+    scroller.scrollTop = previous;
+    return store;
   }
 
   function collectImages(blockMap, docId) {
@@ -166,26 +172,6 @@
       childIds.forEach(walk);
     })(docId);
     return images;
-  }
-
-  async function loadImages(images, onProgress) {
-    const result = {};
-    let done = 0;
-    const queue = images.slice();
-    async function worker() {
-      while (queue.length) {
-        const image = queue.shift();
-        try {
-          result[image.id] = await downloadImage(image.token, image.id);
-        } catch (error) {
-          result[image.id] = "";
-        }
-        done += 1;
-        onProgress(done, images.length);
-      }
-    }
-    await Promise.all([worker(), worker(), worker()]);
-    return result;
   }
 
   function renderHtml(blockMap, docId, title, images) {
@@ -346,9 +332,9 @@
         panel.querySelector("header strong").textContent = doc.title;
         const blocks = await fetchBlocks(doc.id);
         const images = collectImages(blocks, doc.id);
-        status.textContent = images.length ? "正在下载图片 0/" + images.length + "…" : "这篇没有图片，正在排版…";
-        const loaded = await loadImages(images, (done, total) => {
-          status.textContent = "正在下载图片 " + done + "/" + total + "…";
+        status.textContent = "正在滚动页面并截取已经显示的图片…";
+        const loaded = await captureRenderedImages((count) => {
+          status.textContent = "已截取图片 " + count + (images.length ? "/" + images.length : "");
         });
         const failed = images.filter((image) => !loaded[image.id]).length;
         const html = renderHtml(blocks, doc.id, doc.title, loaded);
