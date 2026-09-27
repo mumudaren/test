@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         飞书文档提取并打印
 // @namespace    feishu-extract-text
-// @version      1.1.0
+// @version      1.1.1
 // @description  把已打开的飞书新版文档导出成带图片、可打印的网页，尽量保持标题、分栏和表格位置
 // @match        https://*.feishu.cn/wiki/*
 // @match        https://*.feishu.cn/docx/*
@@ -117,16 +117,21 @@
   }
 
   function imageUrls(token, blockId) {
+    // 只用文档阅读时的预览图。download/all 会被飞书当成导出，无导出权限时会直接拒绝。
     const mount = "mount_point=docx_image&mount_node_token=" + encodeURIComponent(blockId);
-    return [
-      location.origin + "/space/api/box/stream/download/all/" + token + "/?" + mount,
-      "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/all/" + token + "/?" + mount,
-      "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/preview/" + token + "?preview_type=16",
-      "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/v2/cover/" +
+    const heights = [1920, 1280];
+    const covers = heights.map(
+      (height) =>
+        "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/v2/cover/" +
         token +
-        "/?fallback_source=1&height=1920&policy=equal&" +
-        mount,
-    ];
+        "/?fallback_source=1&height=" +
+        height +
+        "&policy=equal&" +
+        mount
+    );
+    return covers.concat([
+      "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/preview/" + token + "?preview_type=16",
+    ]);
   }
 
   async function downloadImage(token, blockId) {
